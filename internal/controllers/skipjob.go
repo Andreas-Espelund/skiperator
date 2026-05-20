@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	goerrors "errors"
 	"fmt"
 
 	"github.com/kartverket/skiperator/internal/config"
@@ -10,10 +11,10 @@ import (
 
 	ctrlutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	skiperatorv1alpha1 "github.com/kartverket/skiperator/api/v1alpha1"
+	skiperatorv1beta1 "github.com/kartverket/skiperator/api/v1beta1"
 	"github.com/kartverket/skiperator/internal/controllers/common"
 	"github.com/kartverket/skiperator/pkg/log"
-	. "github.com/kartverket/skiperator/pkg/reconciliation"
+	"github.com/kartverket/skiperator/pkg/reconciliation"
 	"github.com/kartverket/skiperator/pkg/resourcegenerator/gcp/auth"
 	"github.com/kartverket/skiperator/pkg/resourcegenerator/istio/serviceentry"
 	"github.com/kartverket/skiperator/pkg/resourcegenerator/istio/telemetry"
@@ -61,7 +62,7 @@ type SKIPJobReconciler struct {
 func (r *SKIPJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		// GenerationChangedPredicate is now only applied to the SkipJob itself to allow status changes on Jobs/CronJobs to affect reconcile loops
-		For(&skiperatorv1alpha1.SKIPJob{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		For(&skiperatorv1beta1.SKIPJob{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&batchv1.CronJob{}).
 		Owns(&batchv1.Job{}).
 		// This is added as the Jobs created by CronJobs are not owned by the SKIPJob directly, but rather through the CronJob
@@ -72,10 +73,10 @@ func (r *SKIPJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				return nil
 			}
 
-			if skipJobName, exists := batchJob.Labels[skiperatorv1alpha1.SKIPJobReferenceLabelKey]; exists {
+			if skipJobName, exists := batchJob.Labels[skiperatorv1beta1.SKIPJobReferenceLabelKey]; exists {
 				return []reconcile.Request{
 					{
-						types.NamespacedName{
+						NamespacedName: types.NamespacedName{
 							Namespace: batchJob.Namespace,
 							Name:      skipJobName,
 						},
@@ -115,36 +116,52 @@ func (r *SKIPJobReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	}
 
 	tmpSkipJob := skipJob.DeepCopy()
-	//TODO make sure we don't update the skipjob/application/routing after this step, it will cause endless reconciliations
-	//check that resource request limit 0.3 doesn't overwrite to 300m
-	err = r.setSKIPJobDefaults(ctx, skipJob)
-	if err != nil {
-		return common.RequeueWithError(err)
-	}
+	updateSkipJob := false
+
+	skipJob.FillDefaultSpec()
+	resourceutils.SetSKIPJobLabels(skipJob, skipJob)
 
 	specDiff, err := common.GetObjectDiff(tmpSkipJob.Spec, skipJob.Spec)
 	if err != nil {
 		return common.RequeueWithError(err)
 	}
 
-	statusDiff, err := common.GetObjectDiff(tmpSkipJob.Status, skipJob.Status)
+	labelDiff, err := common.GetObjectDiff(tmpSkipJob.Labels, skipJob.Labels)
 	if err != nil {
 		return common.RequeueWithError(err)
 	}
 
-	if len(statusDiff) > 0 {
-		rLog.Debug("Status has changed", "diff", statusDiff)
-		err = r.GetClient().Status().Update(ctx, skipJob)
-		return reconcile.Result{Requeue: true}, err
+	if len(specDiff) > 0 || len(labelDiff) > 0 {
+		updateSkipJob = true
 	}
 
-	// Finalizer check is due to a bug when updating using controller-runtime
-	// If we update the SKIPJob initially on applied defaults before starting reconciling resources we allow all
-	// updates to be visible even though the controllerDuties may take some time.
-	if len(specDiff) > 0 || (!ctrlutil.ContainsFinalizer(tmpSkipJob, skipJobFinalizer) && ctrlutil.ContainsFinalizer(skipJob, skipJobFinalizer)) {
-		rLog.Debug("Queuing for spec diff")
+	// If we update the SKIPJob initially before starting reconciling resources we allow all
+	// updates to be visible even though controller duties may take some time.
+	if !ctrlutil.ContainsFinalizer(skipJob, skipJobFinalizer) {
+		rLog.Debug("Adding finalizer")
+		ctrlutil.AddFinalizer(skipJob, skipJobFinalizer)
+		updateSkipJob = true
+	}
+
+	// Derive team from the namespace label when not set.
+	if len(skipJob.Spec.Team) == 0 {
+		if name, teamErr := r.teamNameForNamespace(ctx, skipJob); teamErr == nil {
+			skipJob.Spec.Team = name
+			updateSkipJob = true
+		}
+	}
+
+	if updateSkipJob {
 		err = r.GetClient().Update(ctx, skipJob)
 		return reconcile.Result{Requeue: true}, err
+	}
+	// We must fill the default status here as the rest is moved to the webhook
+	skipJob.FillDefaultStatus()
+
+	if err := common.ValidateContainerImageString(skipJob); err != nil {
+		rLog.Error(err, "invalid container image reference")
+		r.SetErrorState(ctx, skipJob, err, "invalid container image reference", "ValidationFailure")
+		return common.DoNotRequeue()
 	}
 
 	//We try to feed the access policy with port values dynamically,
@@ -157,7 +174,7 @@ func (r *SKIPJobReconciler) Reconcile(ctx context.Context, req reconcile.Request
 
 	istioEnabled := r.IsIstioEnabledForNamespace(ctx, skipJob.Namespace)
 
-	reconciliation := NewJobReconciliation(ctx, skipJob, rLog, istioEnabled, r.GetRestConfig(), r.SkiperatorConfig)
+	reconciliationJob := reconciliation.NewJobReconciliation(ctx, skipJob, rLog, istioEnabled, r.GetRestConfig(), r.SkiperatorConfig)
 
 	resourceGeneration := []reconciliationFunc{
 		serviceaccount.Generate,
@@ -170,15 +187,22 @@ func (r *SKIPJobReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	}
 
 	for _, f := range resourceGeneration {
-		if err := f(reconciliation); err != nil {
-			rLog.Error(err, "failed to generate skipjob resource")
+		if err := f(reconciliationJob); err != nil {
 			// At this point we don't have the gvk of the resource yet, so we can't set subresource status.
-			r.SetErrorState(ctx, skipJob, err, "failed to generate skipjob resource", "ResourceGenerationFailure")
+			var subErr *reconciliation.SubResourceError
+			if goerrors.As(err, &subErr) {
+				rLog.Error(subErr.GetWrapErr(), subErr.Message)
+				r.SetErrorState(ctx, skipJob, subErr.GetWrapErr(), subErr.Message, subErr.GetReason())
+			} else {
+				// Safe fallback if the error is not of type SubResourceError, to avoid losing error context
+				rLog.Error(err, "failed to generate skipjob resource")
+				r.SetErrorState(ctx, skipJob, err, "failed to generate skipjob resource", "ResourceGenerationFailure")
+			}
 			return common.RequeueWithError(err)
 		}
 	}
 
-	if err = r.setResourceDefaults(reconciliation.GetResources(), skipJob); err != nil {
+	if err = r.setResourceDefaults(reconciliationJob.GetResources(), skipJob); err != nil {
 		rLog.Error(err, "error when trying to set resource defaults")
 		r.SetErrorState(ctx, skipJob, err, "failed to set skipjob resource defaults", "ResourceDefaultsFailure")
 		return common.RequeueWithError(err)
@@ -186,7 +210,7 @@ func (r *SKIPJobReconciler) Reconcile(ctx context.Context, req reconcile.Request
 
 	processor := resourceprocessor.NewResourceProcessor(r.GetClient(), resourceschemas.GetJobSchemas(r.GetScheme()), r.GetScheme())
 
-	if errs := processor.Process(reconciliation); len(errs) > 0 {
+	if errs := processor.Process(reconciliationJob); len(errs) > 0 {
 		for _, err = range errs {
 			rLog.Error(err, "failed to process resource")
 			r.EmitWarningEvent(skipJob, "ReconcileEndFail", fmt.Sprintf("Failed to process skipjob resources: %s", err.Error()))
@@ -207,8 +231,8 @@ func (r *SKIPJobReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	return common.RequeueWithError(err)
 }
 
-func (r *SKIPJobReconciler) getSKIPJob(ctx context.Context, req reconcile.Request) (*skiperatorv1alpha1.SKIPJob, error) {
-	skipJob := &skiperatorv1alpha1.SKIPJob{}
+func (r *SKIPJobReconciler) getSKIPJob(ctx context.Context, req reconcile.Request) (*skiperatorv1beta1.SKIPJob, error) {
+	skipJob := &skiperatorv1beta1.SKIPJob{}
 	if err := r.GetClient().Get(ctx, req.NamespacedName, skipJob); err != nil {
 		if errors.IsNotFound(err) {
 			return nil, nil
@@ -219,20 +243,19 @@ func (r *SKIPJobReconciler) getSKIPJob(ctx context.Context, req reconcile.Reques
 	return skipJob, nil
 }
 
-func (r *SKIPJobReconciler) setSKIPJobDefaults(ctx context.Context, skipJob *skiperatorv1alpha1.SKIPJob) error {
-	skipJob.FillDefaultSpec()
-
-	if !ctrlutil.ContainsFinalizer(skipJob, skipJobFinalizer) {
-		ctrlutil.AddFinalizer(skipJob, skipJobFinalizer)
+func (r *SKIPJobReconciler) teamNameForNamespace(ctx context.Context, skipJob *skiperatorv1beta1.SKIPJob) (string, error) {
+	ns := &corev1.Namespace{}
+	if err := r.GetClient().Get(ctx, types.NamespacedName{Name: skipJob.Namespace}, ns); err != nil {
+		return "", err
 	}
 
-	resourceutils.SetSKIPJobLabels(skipJob, skipJob)
-	skipJob.FillDefaultStatus()
-
-	return nil
+	teamValue := ns.Labels["team"]
+	if len(teamValue) > 0 {
+		return teamValue, nil
+	}
+	return "", fmt.Errorf("missing value for team label")
 }
-
-func (r *SKIPJobReconciler) setResourceDefaults(resources []client.Object, skipJob *skiperatorv1alpha1.SKIPJob) error {
+func (r *SKIPJobReconciler) setResourceDefaults(resources []client.Object, skipJob *skiperatorv1beta1.SKIPJob) error {
 	for _, resource := range resources {
 		if err := r.SetSubresourceDefaults(resources, skipJob); err != nil {
 			return err
@@ -242,7 +265,7 @@ func (r *SKIPJobReconciler) setResourceDefaults(resources []client.Object, skipJ
 	return nil
 }
 
-func (r *SKIPJobReconciler) finalizeSkipJob(skipJob *skiperatorv1alpha1.SKIPJob, ctx context.Context) error {
+func (r *SKIPJobReconciler) finalizeSkipJob(skipJob *skiperatorv1beta1.SKIPJob, ctx context.Context) error {
 	if ctrlutil.ContainsFinalizer(skipJob, skipJobFinalizer) {
 		ctrlutil.RemoveFinalizer(skipJob, skipJobFinalizer)
 		err := r.GetClient().Update(ctx, skipJob)
@@ -254,7 +277,7 @@ func (r *SKIPJobReconciler) finalizeSkipJob(skipJob *skiperatorv1alpha1.SKIPJob,
 }
 
 func (r *SKIPJobReconciler) getJobsToReconcile(ctx context.Context, object client.Object) []reconcile.Request {
-	var jobsToReconcile skiperatorv1alpha1.SKIPJobList
+	var jobsToReconcile skiperatorv1beta1.SKIPJobList
 	var reconcileRequests []reconcile.Request
 
 	owner := object.GetOwnerReferences()
@@ -282,7 +305,7 @@ func (r *SKIPJobReconciler) getJobsToReconcile(ctx context.Context, object clien
 	return reconcileRequests
 }
 
-func (r *SKIPJobReconciler) getConditionRunning(skipJob *skiperatorv1alpha1.SKIPJob, status v1.ConditionStatus) v1.Condition {
+func (r *SKIPJobReconciler) getConditionRunning(skipJob *skiperatorv1beta1.SKIPJob, status v1.ConditionStatus) v1.Condition {
 	return v1.Condition{
 		Type:               ConditionRunning,
 		Status:             status,
@@ -293,7 +316,7 @@ func (r *SKIPJobReconciler) getConditionRunning(skipJob *skiperatorv1alpha1.SKIP
 	}
 }
 
-func (r *SKIPJobReconciler) getConditionFinished(skipJob *skiperatorv1alpha1.SKIPJob, status v1.ConditionStatus) v1.Condition {
+func (r *SKIPJobReconciler) getConditionFinished(skipJob *skiperatorv1beta1.SKIPJob, status v1.ConditionStatus) v1.Condition {
 	return v1.Condition{
 		Type:               ConditionFinished,
 		Status:             status,
@@ -304,7 +327,7 @@ func (r *SKIPJobReconciler) getConditionFinished(skipJob *skiperatorv1alpha1.SKI
 	}
 }
 
-func (r *SKIPJobReconciler) getConditionFailed(skipJob *skiperatorv1alpha1.SKIPJob, status v1.ConditionStatus, err *string) v1.Condition {
+func (r *SKIPJobReconciler) getConditionFailed(skipJob *skiperatorv1beta1.SKIPJob, status v1.ConditionStatus, err *string) v1.Condition {
 	conditionMessage := "Job failed previous run"
 	if err != nil {
 		conditionMessage = fmt.Sprintf("%v: %v", conditionMessage, *err)
@@ -319,7 +342,7 @@ func (r *SKIPJobReconciler) getConditionFailed(skipJob *skiperatorv1alpha1.SKIPJ
 	}
 }
 
-func (r *SKIPJobReconciler) updateConditions(ctx context.Context, skipJob *skiperatorv1alpha1.SKIPJob) error {
+func (r *SKIPJobReconciler) updateConditions(ctx context.Context, skipJob *skiperatorv1beta1.SKIPJob) error {
 	jobList := &batchv1.JobList{}
 	err := r.GetClient().List(ctx, jobList,
 		client.InNamespace(skipJob.Namespace),
@@ -364,18 +387,18 @@ func (r *SKIPJobReconciler) updateConditions(ctx context.Context, skipJob *skipe
 	}
 
 	// Invalid port condition
-	accessPolicy := skipJob.Spec.Container.AccessPolicy
+	accessPolicy := skipJob.Spec.AccessPolicy
 
 	if accessPolicy != nil && !common.IsInternalRulesValid(accessPolicy) {
 		skipJob.Status.Conditions = append(skipJob.Status.Conditions, common.GetInternalRulesCondition(skipJob, v1.ConditionFalse))
-		skipJob.Status.AccessPolicies = skiperatorv1alpha1.INVALIDCONFIG
+		skipJob.Status.AccessPolicies = skiperatorv1beta1.INVALIDCONFIG
 	} else if accessPolicy != nil && !common.IsExternalRulesValid(accessPolicy) {
 		skipJob.Status.Conditions = append(skipJob.Status.Conditions, common.GetExternalRulesCondition(skipJob, v1.ConditionFalse))
-		skipJob.Status.AccessPolicies = skiperatorv1alpha1.INVALIDCONFIG
+		skipJob.Status.AccessPolicies = skiperatorv1beta1.INVALIDCONFIG
 	} else {
 		skipJob.Status.Conditions = append(skipJob.Status.Conditions, common.GetInternalRulesCondition(skipJob, v1.ConditionTrue))
 		skipJob.Status.Conditions = append(skipJob.Status.Conditions, common.GetExternalRulesCondition(skipJob, v1.ConditionTrue))
-		skipJob.Status.AccessPolicies = skiperatorv1alpha1.READY
+		skipJob.Status.AccessPolicies = skiperatorv1beta1.READY
 	}
 
 	return nil

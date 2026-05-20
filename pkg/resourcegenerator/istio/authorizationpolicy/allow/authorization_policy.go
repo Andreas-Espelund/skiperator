@@ -2,6 +2,7 @@ package allow
 
 import (
 	"fmt"
+
 	skiperatorv1alpha1 "github.com/kartverket/skiperator/api/v1alpha1"
 	"github.com/kartverket/skiperator/pkg/reconciliation"
 	"github.com/kartverket/skiperator/pkg/resourcegenerator/istio/authorizationpolicy"
@@ -16,15 +17,14 @@ func Generate(r reconciliation.Reconciliation) error {
 	ctxLog := r.GetLogger()
 	application, ok := r.GetSKIPObject().(*skiperatorv1alpha1.Application)
 	if !ok {
-		err := fmt.Errorf("failed to cast resource to application")
-		ctxLog.Error(err, "Failed to generate default AuthorizationPolicy")
+		err := &reconciliation.SubResourceError{Message: "Failed to generate allow AuthorizationPolicy", WrapErr: fmt.Errorf("failed to cast resource to application"), Reason: reconciliation.InternalError}
 		return err
 	}
 	ctxLog.Debug("Attempting to generate allow AuthorizationPolicy for application", "application", application.Name)
 
 	if application.Spec.AuthorizationSettings != nil {
 		// Do not create an AuthorizationPolicy if allowAll is set to true
-		if application.Spec.AuthorizationSettings.AllowAll == true {
+		if application.Spec.AuthorizationSettings.AllowAll {
 			return nil
 		}
 	}

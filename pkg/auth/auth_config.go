@@ -1,10 +1,11 @@
 package auth
 
 import (
-	"github.com/kartverket/skiperator/api/v1alpha1/digdirator"
-	"github.com/kartverket/skiperator/api/v1alpha1/istiotypes"
-	"golang.org/x/exp/maps"
+	"maps"
 	"slices"
+
+	"github.com/kartverket/skiperator/api/common/digdirator"
+	"github.com/kartverket/skiperator/api/common/istiotypes"
 )
 
 type AuthConfigs []AuthConfig
@@ -29,7 +30,7 @@ func (authConfigs *AuthConfigs) GetAllPaths() []string {
 			}
 		}
 	}
-	return maps.Keys(uniquePaths)
+	return slices.Collect(maps.Keys(uniquePaths))
 }
 
 func (authConfigs *AuthConfigs) GetIgnoredPaths() []string {
@@ -46,13 +47,10 @@ func (authConfigs *AuthConfigs) GetIgnoredPaths() []string {
 		}
 
 		for _, path := range allowPaths {
-			if _, ok := ignoredPaths[path]; ok {
-				delete(ignoredPaths, path)
-			}
-
+			delete(ignoredPaths, path)
 		}
 	}
-	return maps.Values(ignoredPaths)
+	return slices.Collect(maps.Values(ignoredPaths))
 }
 
 func (authConfigs *AuthConfigs) IgnorePathsFromOtherAuthConfigs() {

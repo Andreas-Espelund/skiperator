@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/kartverket/skiperator/api/common/podtypes"
 	skiperatorv1alpha1 "github.com/kartverket/skiperator/api/v1alpha1"
-	"github.com/kartverket/skiperator/api/v1alpha1/podtypes"
 	"github.com/kartverket/skiperator/pkg/reconciliation"
 	"github.com/kartverket/skiperator/pkg/util"
 	networkingv1api "istio.io/api/networking/v1"
@@ -15,13 +15,10 @@ import (
 )
 
 func Generate(r reconciliation.Reconciliation) error {
-	ctxLog := r.GetLogger()
-
 	if r.GetType() == reconciliation.ApplicationType || r.GetType() == reconciliation.JobType {
 		return getServiceEntries(r)
 	} else {
-		err := fmt.Errorf("unsupported type %s in service entry", r.GetType())
-		ctxLog.Error(err, "Failed to generate service entry")
+		err := &reconciliation.SubResourceError{Message: "Unsupported type in service entry", WrapErr: fmt.Errorf("unsupported type %s in service entry", r.GetType()), Reason: reconciliation.UnsupportedTypeResource}
 		return err
 	}
 }
@@ -35,6 +32,7 @@ func getServiceEntries(r reconciliation.Reconciliation) error {
 	accessPolicy, err := setCloudSqlRule(accessPolicy, object)
 
 	if err != nil {
+		err := &reconciliation.SubResourceError{Message: "Could not set Cloud SQL Rules for Service Entry", WrapErr: err, Reason: reconciliation.InternalError}
 		return err
 	}
 
@@ -60,6 +58,7 @@ func getServiceEntries(r reconciliation.Reconciliation) error {
 
 			ports, err := getPorts(rule.Ports, rule.Ip)
 			if err != nil {
+				err := &reconciliation.SubResourceError{Message: "Could not set port for Service Entry", WrapErr: err, Reason: reconciliation.InternalError}
 				return err
 			}
 

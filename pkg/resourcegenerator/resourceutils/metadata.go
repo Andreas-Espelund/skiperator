@@ -1,10 +1,12 @@
 package resourceutils
 
 import (
-	skiperatorv1alpha1 "github.com/kartverket/skiperator/api/v1alpha1"
-	"golang.org/x/exp/maps"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"maps"
 	"strings"
+
+	skiperatorv1alpha1 "github.com/kartverket/skiperator/api/v1alpha1"
+	skiperatorv1beta1 "github.com/kartverket/skiperator/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var (
@@ -52,7 +54,7 @@ func setResourceLabels(obj client.Object, app *skiperatorv1alpha1.Application) {
 
 func getResourceLabels(app *skiperatorv1alpha1.Application, resourceKind string) (map[string]string, bool) {
 	for k, v := range app.Spec.ResourceLabels {
-		if strings.ToLower(k) == strings.ToLower(resourceKind) {
+		if strings.EqualFold(k, resourceKind) {
 			return v, true
 		}
 	}
@@ -61,9 +63,9 @@ func getResourceLabels(app *skiperatorv1alpha1.Application, resourceKind string)
 
 func FindResourceLabelErrors(app *skiperatorv1alpha1.Application, resources []client.Object) map[string]map[string]string {
 	labelsWithNoMatch := app.Spec.ResourceLabels
-	for k, _ := range labelsWithNoMatch {
+	for k := range labelsWithNoMatch {
 		for _, resource := range resources {
-			if strings.ToLower(k) == strings.ToLower(resource.GetObjectKind().GroupVersionKind().Kind) {
+			if strings.EqualFold(k, resource.GetObjectKind().GroupVersionKind().Kind) {
 				delete(labelsWithNoMatch, k)
 			}
 		}
@@ -90,11 +92,12 @@ func SetRoutingLabels(object client.Object, routing *skiperatorv1alpha1.Routing)
 }
 
 // TODO Porbably smart to move these SET functions to the controllers or types
-func SetSKIPJobLabels(object client.Object, skipJob *skiperatorv1alpha1.SKIPJob) {
+func SetSKIPJobLabels(object client.Object, skipJob *skiperatorv1beta1.SKIPJob) {
 	labels := object.GetLabels()
 	if len(labels) == 0 {
 		labels = make(map[string]string)
 	}
+	maps.Copy(labels, skipJob.Spec.Labels)
 	maps.Copy(labels, skipJob.GetDefaultLabels())
 	object.SetLabels(labels)
 }

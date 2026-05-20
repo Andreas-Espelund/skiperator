@@ -2,18 +2,20 @@ package controllers
 
 import (
 	"context"
+	goerrors "errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"strings"
 
 	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	"github.com/kartverket/skiperator/api/common/digdirator"
 	skiperatorv1alpha1 "github.com/kartverket/skiperator/api/v1alpha1"
-	"github.com/kartverket/skiperator/api/v1alpha1/digdirator"
 	"github.com/kartverket/skiperator/internal/config"
 	"github.com/kartverket/skiperator/internal/controllers/common"
 	jwtAuth "github.com/kartverket/skiperator/pkg/auth"
 	"github.com/kartverket/skiperator/pkg/log"
-	. "github.com/kartverket/skiperator/pkg/reconciliation"
+	"github.com/kartverket/skiperator/pkg/reconciliation"
 	"github.com/kartverket/skiperator/pkg/resourcegenerator/certificate"
 	"github.com/kartverket/skiperator/pkg/resourcegenerator/deployment"
 	"github.com/kartverket/skiperator/pkg/resourcegenerator/gcp/auth"
@@ -40,7 +42,6 @@ import (
 	"github.com/kartverket/skiperator/pkg/util"
 	nais_io_v1 "github.com/nais/liberator/pkg/apis/nais.io/v1"
 	pov1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	"golang.org/x/exp/maps"
 	istionetworkingv1 "istio.io/client-go/pkg/apis/networking/v1"
 	securityv1 "istio.io/client-go/pkg/apis/security/v1"
 	telemetryv1 "istio.io/client-go/pkg/apis/telemetry/v1"
@@ -127,7 +128,7 @@ func (r *ApplicationReconciler) SetupWithManager(mgr ctrl.Manager, concurrentRec
 		Complete(r)
 }
 
-type reconciliationFunc func(reconciliation Reconciliation) error
+type reconciliationFunc func(reconciliation reconciliation.Reconciliation) error
 
 // TODO Clean up logs, events
 
@@ -164,12 +165,6 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req reconcile.Req
 		return common.DoNotRequeue()
 	}
 
-	if err := validateIngresses(application); err != nil {
-		rLog.Error(err, "invalid ingress in application manifest")
-		r.SetErrorState(ctx, application, err, "invalid ingress in application manifest", "InvalidApplication")
-		return common.RequeueWithError(err)
-	}
-
 	// Copy application so we can check for diffs. Should be none on existing applications.
 	tmpApplication := application.DeepCopy()
 
@@ -199,6 +194,18 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req reconcile.Req
 		return reconcile.Result{}, err
 	}
 
+	if err := validateIngresses(application); err != nil {
+		rLog.Error(err, "invalid ingress in application manifest")
+		r.SetErrorState(ctx, application, err, "invalid ingress in application manifest", "InvalidApplication")
+		return common.DoNotRequeue()
+	}
+
+	if err := common.ValidateContainerImageString(application); err != nil {
+		rLog.Error(err, "invalid container image in application manifest")
+		r.SetErrorState(ctx, application, err, "invalid container image in application manifest", "InvalidApplication")
+		return common.DoNotRequeue()
+	}
+
 	//We try to feed the access policy with port values dynamically,
 	//if unsuccessfull we just don't set ports, and rely on podselectors
 	r.UpdateAccessPolicy(ctx, application)
@@ -214,7 +221,7 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req reconcile.Req
 		rLog.Error(err, "unable to resolve request auth config for application", "application", application.Name)
 	}
 
-	reconciliation := NewApplicationReconciliation(ctx, application, rLog, istioEnabled, r.GetRestConfig(), authConfigs, r.SkiperatorConfig)
+	reconciliationApp := reconciliation.NewApplicationReconciliation(ctx, application, rLog, istioEnabled, r.GetRestConfig(), authConfigs, r.SkiperatorConfig)
 
 	//TODO status and conditions in application object
 	funcs := []reconciliationFunc{
@@ -241,16 +248,26 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req reconcile.Req
 	}
 
 	for _, f := range funcs {
-		if err = f(reconciliation); err != nil {
-			rLog.Error(err, "failed to generate application resource")
+		if err = f(reconciliationApp); err != nil {
 			//At this point we don't have the gvk of the resource yet, so we can't set subresource status.
-			r.SetErrorState(ctx, application, err, "failed to generate application resource", "ResourceGenerationFailure")
+			var subErr *reconciliation.SubResourceError
+			if goerrors.As(err, &subErr) {
+				rLog.Error(subErr.GetWrapErr(), subErr.Message)
+				r.SetErrorState(ctx, application, subErr.GetWrapErr(), subErr.Message, subErr.GetReason())
+				if !subErr.IsRetryable() {
+					return common.DoNotRequeue()
+				}
+			} else {
+				// Safe fallback if the error is not of type SubResourceError, to avoid losing error context
+				rLog.Error(err, "failed to generate application resource")
+				r.SetErrorState(ctx, application, err, "failed to generate application resource", "ResourceGenerationFailure")
+			}
 			return common.RequeueWithError(err)
 		}
 	}
 
 	// We need to do this here, so we are sure it's done. Not setting GVK can cause big issues
-	if err = r.setApplicationResourcesDefaults(reconciliation.GetResources(), application); err != nil {
+	if err = r.setApplicationResourcesDefaults(reconciliationApp.GetResources(), application); err != nil {
 		rLog.Error(err, "failed to set application resource defaults")
 		r.SetErrorState(ctx, application, err, "failed to set application resource defaults", "ResourceDefaultsFailure")
 		return common.RequeueWithError(err)
@@ -258,7 +275,7 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req reconcile.Req
 
 	processor := resourceprocessor.NewResourceProcessor(r.GetClient(), resourceschemas.GetApplicationSchemas(r.GetScheme()), r.GetScheme())
 
-	if errs := processor.Process(reconciliation); len(errs) > 0 {
+	if errs := processor.Process(reconciliationApp); len(errs) > 0 {
 		for _, err = range errs {
 			rLog.Error(err, "failed to process resource")
 			r.EmitWarningEvent(application, "ReconcileEndFail", fmt.Sprintf("Failed to process application resources: %s", err.Error()))
@@ -309,7 +326,7 @@ func (r *ApplicationReconciler) cleanUpWatchedResources(ctx context.Context, nam
 	app.SetName(name.Name)
 	app.SetNamespace(name.Namespace)
 
-	reconciliation := NewApplicationReconciliation(ctx, app, log.NewLogger(), false, nil, nil, config.SkiperatorConfig{})
+	reconciliation := reconciliation.NewApplicationReconciliation(ctx, app, log.NewLogger(), false, nil, nil, config.SkiperatorConfig{})
 	processor := resourceprocessor.NewResourceProcessor(r.GetClient(), resourceschemas.GetApplicationSchemas(r.GetScheme()), r.GetScheme())
 
 	return processor.Process(reconciliation)
@@ -371,10 +388,7 @@ func (r *ApplicationReconciler) setApplicationDefaults(application *skiperatorv1
 }
 
 func (r *ApplicationReconciler) isClusterReady(ctx context.Context) bool {
-	if !r.isCrdPresent(ctx, "servicemonitors.monitoring.coreos.com") {
-		return false
-	}
-	return true
+	return r.isCrdPresent(ctx, "servicemonitors.monitoring.coreos.com")
 }
 
 func (r *ApplicationReconciler) teamNameForNamespace(ctx context.Context, app *skiperatorv1alpha1.Application) (string, error) {

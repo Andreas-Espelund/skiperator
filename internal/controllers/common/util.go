@@ -7,8 +7,10 @@ import (
 	"strings"
 
 	"github.com/chmike/domain"
-	skiperatorv1alpha1 "github.com/kartverket/skiperator/api/v1alpha1"
-	"github.com/kartverket/skiperator/api/v1alpha1/podtypes"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/kartverket/skiperator/api/common"
+	"github.com/kartverket/skiperator/api/common/podtypes"
+	"github.com/kartverket/skiperator/pkg/metrics/usage"
 	"github.com/r3labs/diff/v3"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,7 +29,14 @@ func RequeueWithError(err error) (reconcile.Result, error) {
 
 func ShouldReconcile(obj client.Object) bool {
 	labels := obj.GetLabels()
-	return labels["skiperator.kartverket.no/ignore"] != "true"
+	if labels["skiperator.kartverket.no/ignore"] == "true" {
+		// Expose metrics for ignored resource
+		usage.ExposeIgnoredResource(obj)
+		return false
+	}
+
+	usage.RemoveIgnoredResource(obj)
+	return true
 }
 
 func IsNamespaceTerminating(namespace *corev1.Namespace) bool {
@@ -77,7 +86,7 @@ func IsExternalRulesValid(accessPolicy *podtypes.AccessPolicy) bool {
 	return true
 }
 
-func GetInternalRulesCondition(obj skiperatorv1alpha1.SKIPObject, status metav1.ConditionStatus) metav1.Condition {
+func GetInternalRulesCondition(obj common.SKIPObject, status metav1.ConditionStatus) metav1.Condition {
 	message := "Internal rules are valid"
 	if status == metav1.ConditionFalse {
 		message = "Internal rules are invalid, applications or namespaces defined might not exist or have invalid ports"
@@ -92,7 +101,7 @@ func GetInternalRulesCondition(obj skiperatorv1alpha1.SKIPObject, status metav1.
 	}
 }
 
-func GetExternalRulesCondition(obj skiperatorv1alpha1.SKIPObject, status metav1.ConditionStatus) metav1.Condition {
+func GetExternalRulesCondition(obj common.SKIPObject, status metav1.ConditionStatus) metav1.Condition {
 	message := "External rules are valid"
 	if status == metav1.ConditionFalse {
 		message = "External rules are invalid – hostname may be empty or duplicate, or the hostname may not be a valid DNS name"
@@ -111,7 +120,7 @@ func GetObjectDiff[T any](a T, b T) (diff.Changelog, error) {
 	aKind := reflect.ValueOf(a).Kind()
 	bKind := reflect.ValueOf(b).Kind()
 	if aKind != bKind {
-		return nil, fmt.Errorf("The objects to compare are not the same, found obj1: %v, obj2: %v\n", aKind, bKind)
+		return nil, fmt.Errorf("the objects to compare are not the same, found obj1: %v, obj2: %v", aKind, bKind)
 	}
 	changelog, err := diff.Diff(a, b)
 
@@ -129,4 +138,12 @@ func filterOutStatusTimestamps(changelog diff.Changelog) diff.Changelog {
 	changelog = changelog.FilterOut([]string{"Conditions", ".*", "LastTransitionTime"})
 	changelog = changelog.FilterOut([]string{"SubResources", ".*", "TimeStamp"})
 	return changelog
+}
+
+func ValidateContainerImageString(obj common.SKIPObject) error {
+	_, err := name.ParseReference(obj.GetCommonSpec().Image)
+	if err != nil {
+		return err
+	}
+	return nil
 }

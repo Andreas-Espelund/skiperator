@@ -3,8 +3,8 @@ package maskinporten
 import (
 	"fmt"
 
+	"github.com/kartverket/skiperator/api/common/digdirator"
 	skiperatorv1alpha1 "github.com/kartverket/skiperator/api/v1alpha1"
-	"github.com/kartverket/skiperator/api/v1alpha1/digdirator"
 	"github.com/kartverket/skiperator/pkg/reconciliation"
 	"github.com/kartverket/skiperator/pkg/util"
 	naisiov1 "github.com/nais/liberator/pkg/apis/nais.io/v1"
@@ -14,12 +14,12 @@ import (
 func Generate(r reconciliation.Reconciliation) error {
 	ctxLog := r.GetLogger()
 	if r.GetType() != reconciliation.ApplicationType {
-		return fmt.Errorf("unsupported type %s in maskin porten resource", r.GetType())
+		err := &reconciliation.SubResourceError{Message: "Unsupported type in maskinporten resource", WrapErr: fmt.Errorf("unsupported type %s in maskinporten resource", r.GetType()), Reason: reconciliation.UnsupportedTypeResource}
+		return err
 	}
 	application, ok := r.GetSKIPObject().(*skiperatorv1alpha1.Application)
 	if !ok {
-		err := fmt.Errorf("failed to cast resource to application")
-		ctxLog.Error(err, "Failed to generate maskin porten resource")
+		err := &reconciliation.SubResourceError{Message: "Failed to generate maskinporten resource", WrapErr: fmt.Errorf("failed to cast resource to application"), Reason: reconciliation.InternalError}
 		return err
 	}
 
@@ -28,7 +28,7 @@ func Generate(r reconciliation.Reconciliation) error {
 		return nil
 	}
 
-	ctxLog.Debug("Attempting to generate maskin porten resource  for application", "application", application.Name)
+	ctxLog.Debug("Attempting to generate maskinporten resource for application", "application", application.Name)
 
 	var err error
 
@@ -45,11 +45,12 @@ func Generate(r reconciliation.Reconciliation) error {
 
 	maskinporten.Spec, err = getMaskinportenSpec(application)
 	if err != nil {
+		err := &reconciliation.SubResourceError{Message: "Failed to generate maskinporten resource spec", WrapErr: err, Reason: reconciliation.ResourceDependencyNotFound}
 		return err
 	}
 
 	r.AddResource(&maskinporten)
-	ctxLog.Debug("Finished generating maskin porten resource for application", "application", application.Name)
+	ctxLog.Debug("Finished generating maskinporten resource for application", "application", application.Name)
 	return nil
 }
 
